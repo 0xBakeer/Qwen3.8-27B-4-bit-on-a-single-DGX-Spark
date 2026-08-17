@@ -1,0 +1,730 @@
+<!DOCTYPE html>
+<!--
+  Double Pendulum — chaotic divergence
+  ---------------------------------------------------------------------------
+  Three.js target: r170 (three@0.170.0) loaded via ES-module import map from
+  the jsDelivr CDN. No build step, no bundler, no local dependencies.
+
+  Physics: exact double-pendulum EOM derived from the Lagrangian (no
+  small-angle approximation), integrated with classical RK4 at a fixed
+  timestep (1/300 s). A time accumulator keeps the physics rate independent
+  of the render framerate. Eight identical pendulums run in lockstep, each
+  seeded with an extra 1e-6 rad of angle so you can watch them track each
+  other and then diverge.
+
+  Shadows: SKIPPED. A dynamic shadow map would force a second render pass
+  every frame with 16+ moving casters (2 bobs + 2 rods x 8) re-projected
+  through the shadow camera. That is not "cheap" on integrated GPUs and the
+  visual payoff for thin rods and small spheres against a faint grid is
+  negligible, so lighting uses standard/hemisphere lights only.
+  ---------------------------------------------------------------------------
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Double Pendulum — Chaotic Divergence</title>
+<style>
+  :root {
+    --panel-bg: rgba(14, 17, 27, 0.72);
+    --panel-border: rgba(120, 140, 190, 0.18);
+    --ink: #c8d2ea;
+    --ink-dim: #7f8bb0;
+    --accent: #ff5d5d;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #0b0d14; color: var(--ink);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  #app { position: fixed; inset: 0; }
+  #app canvas { display: block; }
+
+  .panel {
+    position: fixed;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    padding: 12px 14px;
+    line-height: 1.5;
+    user-select: none;
+  }
+  #hud { top: 14px; left: 14px; min-width: 250px; }
+  #hud h1 { margin: 0 0 6px; font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }
+  #hud .row { display: flex; justify-content: space-between; gap: 16px; }
+  #hud .row span:last-child { color: #fff; }
+  #hud .big { color: var(--accent); }
+
+  #panel { top: 14px; right: 14px; width: 232px; }
+  #panel .sec {
+    margin: 10px 0 6px; font-size: 10px; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--ink-dim);
+  }
+  #panel .sec:first-child { margin-top: 0; }
+  #panel label { display: block; margin: 7px 0; }
+  #panel label .lab { display: flex; justify-content: space-between; margin-bottom: 3px; }
+  #panel label .lab b { font-weight: 600; color: #fff; }
+  #panel input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 4px; border-radius: 3px;
+    background: rgba(120, 140, 190, 0.28); outline: none;
+  }
+  #panel input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 13px; height: 13px; border-radius: 50%;
+    background: var(--accent); cursor: pointer; border: none;
+  }
+  #panel input[type=range]::-moz-range-thumb {
+    width: 13px; height: 13px; border-radius: 50%;
+    background: var(--accent); cursor: pointer; border: none;
+  }
+  .btns { display: flex; gap: 6px; margin-top: 4px; }
+  .btns button {
+    flex: 1; padding: 7px 0; cursor: pointer;
+    background: rgba(120, 140, 190, 0.14);
+    border: 1px solid var(--panel-border); color: var(--ink);
+    border-radius: 7px; font: inherit; font-size: 12px;
+  }
+  .btns button:hover { background: rgba(120, 140, 190, 0.26); color: #fff; }
+  .btns button.active { background: var(--accent); border-color: var(--accent); color: #16101a; }
+  .hint { margin-top: 10px; color: var(--ink-dim); font-size: 11px; }
+
+  #phase-wrap { bottom: 14px; right: 14px; padding: 8px 10px 10px; }
+  #phase-wrap .cap { font-size: 10px; color: var(--ink-dim); margin-bottom: 6px; letter-spacing: 0.04em; }
+  #phase { display: block; width: 262px; height: 186px; background: rgba(8,10,17,0.6); border-radius: 6px; }
+
+  #legend { bottom: 14px; left: 14px; display: flex; align-items: center; gap: 10px; }
+  #legend .sw { display: flex; flex-direction: column; gap: 2px; }
+  #legend .bar { width: 150px; height: 8px; border-radius: 4px; }
+  #legend .lab { display: flex; justify-content: space-between; color: var(--ink-dim); font-size: 10px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="hud" class="panel">
+  <h1>Double Pendulum · 8 seeds, &Delta;θ = 1&times;10<sup>&minus;6</sup> rad</h1>
+  <div class="row"><span>elapsed</span><span id="ro-time">0.00 s</span></div>
+  <div class="row"><span>angular spread (1st&thinsp;&harr;&thinsp;last)</span><span id="ro-spread">0.0000 rad</span></div>
+  <div class="row"><span>spread &gt; 0.1 rad at</span><span id="ro-cross" class="big">&mdash;</span></div>
+</div>
+
+<div id="panel" class="panel">
+  <div class="sec">Pendulum</div>
+  <label><span class="lab"><span>rod L1</span><b id="v-l1"></b></span>
+    <input type="range" id="s-l1" min="0.3" max="3" step="0.01" value="1.0"></label>
+  <label><span class="lab"><span>rod L2</span><b id="v-l2"></b></span>
+    <input type="range" id="s-l2" min="0.3" max="3" step="0.01" value="1.0"></label>
+  <label><span class="lab"><span>mass m1</span><b id="v-m1"></b></span>
+    <input type="range" id="s-m1" min="0.1" max="5" step="0.05" value="1.0"></label>
+  <label><span class="lab"><span>mass m2</span><b id="v-m2"></b></span>
+    <input type="range" id="s-m2" min="0.1" max="5" step="0.05" value="1.0"></label>
+  <label><span class="lab"><span>gravity g</span><b id="v-g"></b></span>
+    <input type="range" id="s-g" min="0.5" max="25" step="0.05" value="9.81"></label>
+  <label><span class="lab"><span>trail length</span><b id="v-trail"></b></span>
+    <input type="range" id="s-trail" min="0" max="1200" step="10" value="420"></label>
+
+  <div class="sec">Playback</div>
+  <div class="btns">
+    <button id="b-pause">Pause</button>
+    <button id="b-step">Step</button>
+    <button id="b-reset">Reset</button>
+  </div>
+  <div class="hint">Drag either bob of the first (red) pendulum to reposition; releasing restarts all eight from that configuration.</div>
+</div>
+
+<div id="legend" class="panel">
+  <div class="sw">
+    <div class="bar" style="background: linear-gradient(90deg,
+      hsl(7,85%,58%), hsl(37,85%,58%), hsl(67,85%,58%), hsl(97,85%,58%),
+      hsl(127,85%,58%), hsl(157,85%,58%), hsl(187,85%,58%), hsl(222,85%,58%))"></div>
+    <div class="lab"><span>seed 0</span><span>seed 7</span></div>
+  </div>
+</div>
+
+<div id="phase-wrap" class="panel">
+  <div class="cap">phase space &middot; seed 0 &middot; &theta;<sub>1</sub> vs &omega;<sub>1</sub></div>
+  <canvas id="phase"></canvas>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ------------------------------------------------------------------ *
+ *  Configuration
+ * ------------------------------------------------------------------ */
+const N = 8;              // number of seeds
+const PERTURB = 1e-6;     // extra radians added per seed
+const DT = 1 / 300;       // fixed physics timestep (s)
+const TRAIL_MAX = 1200;   // hard cap on stored trail vertices
+const ROD_R = 0.02;       // rod radius (world units)
+const DEFAULT_T1 = 1.8;   // base start angle (rad, from vertical)
+const DEFAULT_T2 = 0.9;
+
+const params = {
+  g: 9.81,
+  l1: 1.0, l2: 1.0,
+  m1: 1.0, m2: 1.0,
+  trailLen: 420,
+};
+
+// base configuration the perturbations are applied on top of
+let t1Base = DEFAULT_T1;
+let t2Base = DEFAULT_T2;
+
+// per-seed colour ramp (red -> blue)
+const pendColors = [];
+for (let i = 0; i < N; i++) {
+  const hue = 0.02 + (i / (N - 1)) * 0.62;
+  const c = new THREE.Color().setHSL(hue, 0.85, 0.58);
+  pendColors.push({ color: c, css: `hsl(${(hue * 360) | 0},85%,58%)` });
+}
+
+// per-seed state: [t1, t2, w1, w2]
+const pends = [];
+for (let i = 0; i < N; i++) pends.push({ t1: 0, t2: 0, w1: 0, w2: 0 });
+
+let simTime = 0;          // simulated seconds
+let tCross = null;        // simTime when spread first exceeded 0.1 rad
+let acc = 0;              // accumulator (s)
+let paused = false;
+let didStep = false;      // true when physics advanced this frame
+
+/* ------------------------------------------------------------------ *
+ *  Physics: exact EOM from the Lagrangian
+ * ------------------------------------------------------------------ */
+// theta measured from the downward vertical. Standard closed form:
+//   den = 2 m1 + m2 - m2 cos(2 (t1 - t2))
+//   a1 = [ -g(2 m1 + m2) sin t1 - m2 g sin(t1 - 2 t2)
+//          - 2 sin(t1 - t2) m2 (w2^2 l2 + w1^2 l1 cos(t1 - t2)) ] / (l1 den)
+//   a2 = [ 2 sin(t1 - t2) ( w1^2 l1 (m1 + m2) + g (m1 + m2) cos t1
+//          + w2^2 l2 m2 cos(t1 - t2) ) ] / (l2 den)
+const K1 = new Float64Array(4), K2 = new Float64Array(4),
+      K3 = new Float64Array(4), K4 = new Float64Array(4);
+
+function deriv(t1, t2, w1, w2, out) {
+  const { l1, l2, m1, m2, g } = params;
+  const d = t1 - t2;
+  const sd = Math.sin(d), cd = Math.cos(d);
+  const den = 2 * m1 + m2 - m2 * Math.cos(2 * d);   // >= 2 m1 > 0
+  const a1 = (
+    -g * (2 * m1 + m2) * Math.sin(t1)
+    - m2 * g * Math.sin(t1 - 2 * t2)
+    - 2 * sd * m2 * (w2 * w2 * l2 + w1 * w1 * l1 * cd)
+  ) / (l1 * den);
+  const a2 = (
+    2 * sd * (
+      w1 * w1 * l1 * (m1 + m2)
+      + g * (m1 + m2) * Math.cos(t1)
+      + w2 * w2 * l2 * m2 * cd
+    )
+  ) / (l2 * den);
+  out[0] = w1; out[1] = w2; out[2] = a1; out[3] = a2;
+}
+
+function stepPend(p, dt) {
+  deriv(p.t1, p.t2, p.w1, p.w2, K1);
+  deriv(p.t1 + 0.5 * dt * K1[0], p.t2 + 0.5 * dt * K1[1],
+        p.w1 + 0.5 * dt * K1[2], p.w2 + 0.5 * dt * K1[3], K2);
+  deriv(p.t1 + 0.5 * dt * K2[0], p.t2 + 0.5 * dt * K2[1],
+        p.w1 + 0.5 * dt * K2[2], p.w2 + 0.5 * dt * K2[3], K3);
+  deriv(p.t1 + dt * K3[0], p.t2 + dt * K3[1],
+        p.w1 + dt * K3[2], p.w2 + dt * K3[3], K4);
+  p.t1 += (dt / 6) * (K1[0] + 2 * K2[0] + 2 * K3[0] + K4[0]);
+  p.t2 += (dt / 6) * (K1[1] + 2 * K2[1] + 2 * K3[1] + K4[1]);
+  p.w1 += (dt / 6) * (K1[2] + 2 * K2[2] + 2 * K3[2] + K4[2]);
+  p.w2 += (dt / 6) * (K1[3] + 2 * K2[3] + 2 * K3[3] + K4[3]);
+}
+
+function tickPhysics() {
+  for (let i = 0; i < N; i++) stepPend(pends[i], DT);
+}
+
+/* ------------------------------------------------------------------ *
+ *  Three.js scene
+ * ------------------------------------------------------------------ */
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x0b0d14, 1);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0d14);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.05, 300);
+camera.position.set(1.5, 0.9, 4.0);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, -0.8, 0);
+
+// lighting (no shadows — see header comment)
+scene.add(new THREE.HemisphereLight(0x99bbff, 0x202028, 0.85));
+const dir = new THREE.DirectionalLight(0xffffff, 1.7);
+dir.position.set(6, 10, 8);
+scene.add(dir);
+const fill = new THREE.DirectionalLight(0x88aaff, 0.35);
+fill.position.set(-6, 4, -6);
+scene.add(fill);
+
+// shared unit geometries (never disposed; per-mesh scale/orient instead)
+const unitCylGeo = new THREE.CylinderGeometry(1, 1, 1, 10);
+const unitSphereGeo = new THREE.SphereGeometry(1, 24, 16);
+const pivotGeo = new THREE.SphereGeometry(1, 16, 12);
+const pivotMat = new THREE.MeshStandardMaterial({ color: 0x9aa4c4, roughness: 0.4, metalness: 0.6 });
+const pivot = new THREE.Mesh(pivotGeo, pivotMat);
+pivot.scale.setScalar(0.045);
+scene.add(pivot);
+
+// ground grid
+let grid = null;
+function updateGrid() {
+  const S = params.l1 + params.l2;
+  if (!grid) {
+    grid = new THREE.GridHelper(1, 24, 0x2a3050, 0x181c2c);
+    scene.add(grid);
+  }
+  grid.scale.setScalar(S * 2 + 6);
+  grid.position.y = -(S + 0.6);
+}
+
+function frameScene(resetCam) {
+  const S = params.l1 + params.l2;
+  controls.target.set(0, -S * 0.35, 0);
+  controls.minDistance = S * 0.4;
+  controls.maxDistance = S * 8;
+  if (resetCam) {
+    camera.fov = 50;
+    camera.updateProjectionMatrix();
+    camera.position.set(S * 0.9, S * 0.5, S * 2.1);
+  }
+  controls.update();
+}
+
+// per-seed meshes + trails
+let sceneGroup = null;
+let meshes = [];
+let trails = [];
+
+function clearSceneGroup() {
+  if (!sceneGroup) return;
+  sceneGroup.traverse((o) => {
+    if (o.geometry && o.geometry !== unitCylGeo && o.geometry !== unitSphereGeo) o.geometry.dispose();
+    if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => m.dispose());
+  });
+  scene.remove(sceneGroup);
+  sceneGroup = null;
+}
+
+function rebuildScene() {
+  clearSceneGroup();
+  sceneGroup = new THREE.Group();
+
+  meshes = [];
+  trails = [];
+  for (let i = 0; i < N; i++) {
+    const col = pendColors[i].color;
+    const rodMat = new THREE.MeshStandardMaterial({
+      color: col.clone().multiplyScalar(0.5), roughness: 0.5, metalness: 0.4,
+    });
+    const bobMat = new THREE.MeshStandardMaterial({
+      color: col.clone(), roughness: 0.3, metalness: 0.5,
+      emissive: col.clone().multiplyScalar(0.12),
+    });
+    const rod1 = new THREE.Mesh(unitCylGeo, rodMat);
+    const rod2 = new THREE.Mesh(unitCylGeo, rodMat);
+    const r1 = 0.09 * Math.cbrt(params.m1);
+    const r2 = 0.09 * Math.cbrt(params.m2);
+    const bob1 = new THREE.Mesh(unitSphereGeo, bobMat); bob1.scale.setScalar(r1);
+    const bob2 = new THREE.Mesh(unitSphereGeo, bobMat); bob2.scale.setScalar(r2);
+    sceneGroup.add(rod1, rod2, bob1, bob2);
+
+    // trail: pre-allocated buffers, updated in place each frame
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(TRAIL_MAX * 3);
+    const colArr = new Float32Array(TRAIL_MAX * 3);
+    const pAttr = new THREE.BufferAttribute(pos, 3); pAttr.setUsage(THREE.DynamicDrawUsage);
+    const cAttr = new THREE.BufferAttribute(colArr, 3); cAttr.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('position', pAttr);
+    geo.setAttribute('color', cAttr);
+    geo.setDrawRange(0, 0);
+    const lineMat = new THREE.LineBasicMaterial({
+      vertexColors: true, transparent: true,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const line = new THREE.Line(geo, lineMat);
+    line.frustumCulled = false;   // buffer is updated in place; keep it always drawn
+    sceneGroup.add(line);
+    trails.push({ pos, pAttr, cAttr, geo, count: 0 });
+    meshes.push({ rod1, rod2, bob1, bob2 });
+  }
+  scene.add(sceneGroup);
+  updateGrid();
+  frameScene(meshesBuiltOnce ? false : true);
+  meshesBuiltOnce = true;
+}
+let meshesBuiltOnce = false;
+
+const _v = new THREE.Vector3();
+const UP = new THREE.Vector3(0, 1, 0);
+function orientRod(mesh, ax, ay, az, bx, by, bz) {
+  const dx = bx - ax, dy = by - ay, dz = bz - az;
+  const len = Math.hypot(dx, dy, dz);
+  if (len < 1e-6) { mesh.visible = false; return; }
+  mesh.visible = true;
+  mesh.position.set((ax + bx) / 2, (ay + by) / 2, (az + bz) / 2);
+  _v.set(dx, dy, dz).normalize();
+  mesh.quaternion.setFromUnitVectors(UP, _v);
+  mesh.scale.set(ROD_R, len, ROD_R);
+}
+
+// shift the ring right by one, write the new tip at index 0, recompute the
+// fade gradient, then mark the (pre-allocated) attributes dirty. No
+// geometry is rebuilt here — only the attribute buffers are touched.
+function pushTrail(i, x, y, z) {
+  const tr = trails[i];
+  const cap = params.trailLen;
+  if (cap <= 0) { tr.count = 0; tr.geo.setDrawRange(0, 0); tr.pAttr.needsUpdate = true; tr.cAttr.needsUpdate = true; return; }
+  let count = tr.count;
+  if (count >= cap) {
+    for (let k = cap - 1; k > 0; k--) {
+      tr.pos[3 * k] = tr.pos[3 * (k - 1)];
+      tr.pos[3 * k + 1] = tr.pos[3 * (k - 1) + 1];
+      tr.pos[3 * k + 2] = tr.pos[3 * (k - 1) + 2];
+    }
+  } else {
+    for (let k = count - 1; k > 0; k--) {
+      tr.pos[3 * k] = tr.pos[3 * (k - 1)];
+      tr.pos[3 * k + 1] = tr.pos[3 * (k - 1) + 1];
+      tr.pos[3 * k + 2] = tr.pos[3 * (k - 1) + 2];
+    }
+    count++;
+  }
+  tr.pos[0] = x; tr.pos[1] = y; tr.pos[2] = z;
+  tr.count = count;
+  const c = pendColors[i].color;
+  const inv = 1 / Math.max(1, cap - 1);
+  for (let k = 0; k < count; k++) {
+    const f = 1 - k * inv;
+    const a = f * f;
+    tr.cAttr.array[3 * k] = c.r * a;
+    tr.cAttr.array[3 * k + 1] = c.g * a;
+    tr.cAttr.array[3 * k + 2] = c.b * a;
+  }
+  tr.pAttr.needsUpdate = true;
+  tr.cAttr.needsUpdate = true;
+  tr.geo.setDrawRange(0, count);
+}
+
+function updateMeshes(pushTrails) {
+  const { l1, l2 } = params;
+  for (let i = 0; i < N; i++) {
+    const p = pends[i];
+    const x1 = l1 * Math.sin(p.t1);
+    const y1 = -l1 * Math.cos(p.t1);
+    const x2 = x1 + l2 * Math.sin(p.t2);
+    const y2 = y1 - l2 * Math.cos(p.t2);
+    const m = meshes[i];
+    m.bob1.position.set(x1, y1, 0);
+    m.bob2.position.set(x2, y2, 0);
+    orientRod(m.rod1, 0, 0, 0, x1, y1, 0);
+    orientRod(m.rod2, x1, y1, 0, x2, y2, 0);
+    if (pushTrails) pushTrail(i, x2, y2, 0);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  Phase-space overlay (seed 0: theta1 vs omega1)
+ * ------------------------------------------------------------------ */
+const phaseCanvas = document.getElementById('phase');
+const phaseCtx = phaseCanvas.getContext('2d');
+let phaseCssW = 262, phaseCssH = 186, phaseDpr = 1;
+const PHASE_MAX = 520;
+let phaseHist = [];      // flat [t1, w1, t1, w1, ...], newest last
+let phaseWMax = 3;
+
+function pushPhase() {
+  const p = pends[0];
+  const t1 = Math.atan2(Math.sin(p.t1), Math.cos(p.t1));   // fold to [-PI, PI]
+  phaseHist.push(t1, p.w1);
+  if (phaseHist.length > PHASE_MAX * 2) phaseHist.splice(0, 2);
+  const target = Math.max(2, Math.abs(p.w1) * 1.25);
+  phaseWMax += (target - phaseWMax) * 0.05;
+}
+
+function drawPhase() {
+  const ctx = phaseCtx;
+  ctx.setTransform(phaseDpr, 0, 0, phaseDpr, 0, 0);
+  const W = phaseCssW, H = phaseCssH, pad = 20;
+  ctx.clearRect(0, 0, W, H);
+  const wMax = phaseWMax;
+  const mx = (t) => pad + ((t + Math.PI) / (2 * Math.PI)) * (W - 2 * pad);
+  const my = (w) => H - pad - ((w + wMax) / (2 * wMax)) * (H - 2 * pad);
+
+  ctx.strokeStyle = 'rgba(120,140,180,0.28)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(mx(0), pad); ctx.lineTo(mx(0), H - pad);
+  ctx.moveTo(pad, my(0)); ctx.lineTo(W - pad, my(0));
+  ctx.stroke();
+
+  ctx.fillStyle = 'rgba(160,175,210,0.6)';
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.fillText('theta1', mx(0) + 4, H - pad - 4);
+  ctx.fillText('omega1', pad + 3, my(0) - 4);
+
+  const n = phaseHist.length / 2;
+  const css = pendColors[0].css;
+  for (let i = 0; i < n; i++) {
+    const a = (i + 1) / n;
+    ctx.globalAlpha = a * a * 0.9;
+    ctx.fillStyle = css;
+    const x = mx(phaseHist[i * 2]), y = my(phaseHist[i * 2 + 1]);
+    ctx.fillRect(x - 1, y - 1, 2.2, 2.2);
+  }
+  ctx.globalAlpha = 1;
+  if (n > 0) {
+    const x = mx(phaseHist[(n - 1) * 2]), y = my(phaseHist[(n - 1) * 2 + 1]);
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(x, y, 2.6, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  Readout
+ * ------------------------------------------------------------------ */
+const roTime = document.getElementById('ro-time');
+const roSpread = document.getElementById('ro-spread');
+const roCross = document.getElementById('ro-cross');
+
+function updateReadout() {
+  const a = pends[0], b = pends[N - 1];
+  // minimum (wrapped) angular separation per coordinate, so the spread
+  // stays a bounded, interpretable quantity as angles wind over time
+  const d1 = Math.atan2(Math.sin(b.t1 - a.t1), Math.cos(b.t1 - a.t1));
+  const d2 = Math.atan2(Math.sin(b.t2 - a.t2), Math.cos(b.t2 - a.t2));
+  const spread = Math.hypot(d1, d2);
+  if (tCross === null && spread > 0.1) tCross = simTime;
+  roTime.textContent = simTime.toFixed(2) + ' s';
+  roSpread.textContent = spread.toFixed(4) + ' rad';
+  roCross.textContent = tCross === null ? '\u2014' : tCross.toFixed(2) + ' s';
+}
+
+/* ------------------------------------------------------------------ *
+ *  Restart / reset
+ * ------------------------------------------------------------------ */
+function restartAll() {
+  for (let i = 0; i < N; i++) {
+    pends[i].t1 = t1Base + i * PERTURB;
+    pends[i].t2 = t2Base + i * PERTURB;
+    pends[i].w1 = 0;
+    pends[i].w2 = 0;
+  }
+  simTime = 0; tCross = null; acc = 0;
+  phaseHist = [];
+  for (const tr of trails) { tr.count = 0; tr.geo.setDrawRange(0, 0); }
+  didStep = true;   // force an immediate mesh refresh next frame
+}
+
+function rebuildAll() {
+  rebuildScene();
+  restartAll();
+}
+
+/* ------------------------------------------------------------------ *
+ *  Interaction: drag a bob of seed 0
+ * ------------------------------------------------------------------ */
+const ray = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const dragPlane = new THREE.Plane();
+const dragPoint = new THREE.Vector3();
+let dragBob = null;      // 1 or 2 while dragging
+
+function setNdc(e) {
+  const r = renderer.domElement.getBoundingClientRect();
+  ndc.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+  ndc.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+}
+
+renderer.domElement.style.touchAction = 'none';
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  setNdc(e);
+  ray.setFromCamera(ndc, camera);
+  const hits = ray.intersectObjects([meshes[0].bob1, meshes[0].bob2], false);
+  if (hits.length) {
+    dragBob = (hits[0].object === meshes[0].bob2) ? 2 : 1;
+    controls.enabled = false;
+    const camDir = new THREE.Vector3();
+    camera.getWorldDirection(camDir);
+    dragPlane.setFromNormalAndCoplanarPoint(camDir, hits[0].point);
+    document.body.style.cursor = 'grabbing';
+    renderer.domElement.setPointerCapture(e.pointerId);
+  }
+});
+
+window.addEventListener('pointermove', (e) => {
+  if (dragBob) {
+    setNdc(e);
+    ray.setFromCamera(ndc, camera);
+    if (ray.ray.intersectPlane(dragPlane, dragPoint)) {
+      const { l1 } = params;
+      if (dragBob === 1) {
+        t1Base = Math.atan2(dragPoint.x, -dragPoint.y);
+      } else {
+        const x1 = l1 * Math.sin(t1Base);
+        const y1 = -l1 * Math.cos(t1Base);
+        t2Base = Math.atan2(dragPoint.x - x1, -(dragPoint.y - y1));
+      }
+      pends[0].t1 = t1Base; pends[0].t2 = t2Base;
+      pends[0].w1 = 0; pends[0].w2 = 0;
+      didStep = true;
+      updateMeshes(false);   // live preview, no trail push
+    }
+  } else if (e.buttons === 0) {
+    setNdc(e);
+    ray.setFromCamera(ndc, camera);
+    const hits = ray.intersectObjects([meshes[0].bob1, meshes[0].bob2], false);
+    document.body.style.cursor = hits.length ? 'grab' : 'default';
+  }
+});
+
+window.addEventListener('pointerup', () => {
+  if (dragBob) {
+    dragBob = null;
+    controls.enabled = true;
+    document.body.style.cursor = 'default';
+    restartAll();   // reapply perturbations on top of the new base config
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ *  UI wiring
+ * ------------------------------------------------------------------ */
+const $ = (id) => document.getElementById(id);
+
+function setLabel(id, v, dec) { $(id).textContent = v.toFixed(dec); }
+
+// gravity + trail are live (no rebuild); mass + rod length rebuild cleanly
+$('s-g').addEventListener('input', (e) => {
+  params.g = parseFloat(e.target.value);
+  setLabel('v-g', params.g, 2);
+});
+$('s-trail').addEventListener('input', (e) => {
+  params.trailLen = Math.round(parseFloat(e.target.value));
+  setLabel('v-trail', params.trailLen, 0);
+  for (const tr of trails) if (tr.count > params.trailLen) tr.count = params.trailLen;
+});
+$('s-l1').addEventListener('input', (e) => { params.l1 = parseFloat(e.target.value); setLabel('v-l1', params.l1, 2); rebuildAll(); });
+$('s-l2').addEventListener('input', (e) => { params.l2 = parseFloat(e.target.value); setLabel('v-l2', params.l2, 2); rebuildAll(); });
+$('s-m1').addEventListener('input', (e) => { params.m1 = parseFloat(e.target.value); setLabel('v-m1', params.m1, 2); rebuildAll(); });
+$('s-m2').addEventListener('input', (e) => { params.m2 = parseFloat(e.target.value); setLabel('v-m2', params.m2, 2); rebuildAll(); });
+
+const bPause = $('b-pause');
+bPause.addEventListener('click', () => {
+  paused = !paused;
+  bPause.textContent = paused ? 'Resume' : 'Pause';
+  bPause.classList.toggle('active', paused);
+  if (!paused) acc = 0;   // avoid a jump after pausing a while
+});
+$('b-step').addEventListener('click', () => {
+  tickPhysics();
+  simTime += DT;
+  didStep = true;
+});
+$('b-reset').addEventListener('click', () => {
+  t1Base = DEFAULT_T1;
+  t2Base = DEFAULT_T2;
+  restartAll();
+});
+
+/* ------------------------------------------------------------------ *
+ *  Resize
+ * ------------------------------------------------------------------ */
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+  const r = phaseCanvas.getBoundingClientRect();
+  phaseDpr = Math.min(window.devicePixelRatio, 2);
+  phaseCssW = r.width; phaseCssH = r.height;
+  phaseCanvas.width = Math.round(r.width * phaseDpr);
+  phaseCanvas.height = Math.round(r.height * phaseDpr);
+}
+window.addEventListener('resize', onResize);
+
+/* ------------------------------------------------------------------ *
+ *  Main loop
+ * ------------------------------------------------------------------ */
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now() / 1000;
+  let realDt = now - lastTime;
+  lastTime = now;
+  if (realDt > 0.05) realDt = 0.05;   // clamp to avoid spiral of death
+
+  if (!paused) {
+    acc += realDt;
+    let steps = 0;
+    while (acc >= DT && steps < 64) {
+      tickPhysics();
+      acc -= DT;
+      simTime += DT;
+      steps++;
+      didStep = true;
+    }
+    if (steps >= 64) acc = 0;
+  }
+
+  const pushing = didStep && dragBob === null;
+  updateMeshes(pushing);
+  if (didStep && dragBob === null) pushPhase();
+
+  updateReadout();
+  drawPhase();
+  controls.update();
+  renderer.render(scene, camera);
+  didStep = false;
+}
+
+let lastTime = performance.now() / 1000;
+
+/* ------------------------------------------------------------------ *
+ *  Boot
+ * ------------------------------------------------------------------ */
+params.l1 = parseFloat($('s-l1').value);
+params.l2 = parseFloat($('s-l2').value);
+params.m1 = parseFloat($('s-m1').value);
+params.m2 = parseFloat($('s-m2').value);
+params.g = parseFloat($('s-g').value);
+params.trailLen = Math.round(parseFloat($('s-trail').value));
+setLabel('v-l1', params.l1, 2); setLabel('v-l2', params.l2, 2);
+setLabel('v-m1', params.m1, 2); setLabel('v-m2', params.m2, 2);
+setLabel('v-g', params.g, 2); setLabel('v-trail', params.trailLen, 0);
+
+rebuildScene();
+restartAll();
+onResize();
+animate();
+</script>
+</body>
+</html>

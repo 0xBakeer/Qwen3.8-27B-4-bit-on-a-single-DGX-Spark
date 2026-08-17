@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>N-Body Orbital Mechanics — three.js</title>
+<!--
+  Single-file three.js N-body orbital mechanics simulation.
+  Target: three.js r160 (0.160.0), loaded from the jsDelivr CDN via an
+  ES module import map below. No build step, no local dependencies,
+  no external assets.
+  Physics: pairwise Newtonian gravity for every body, integrated with
+  velocity Verlet at a fixed timestep DT = 0.005 sim-time units
+  (substepped per frame), with a Plummer softening term epsilon = 1.0
+  in the force law to avoid the close-encounter singularity.
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #020308; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 14px; left: 14px; z-index: 10; width: 296px;
+    font: 11px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #c9d4ea; background: rgba(8, 12, 24, 0.74);
+    border: 1px solid rgba(122, 142, 192, 0.28); border-radius: 10px;
+    padding: 12px 14px; backdrop-filter: blur(6px); user-select: none;
+  }
+  #hud h1 { margin: 0 0 2px; font-size: 11px; font-weight: 600; letter-spacing: 0.12em; color: #8fa3c8; }
+  .meta { color: #5d6d8f; font-size: 10px; margin-bottom: 8px; }
+  .readout { white-space: pre; }
+  .row { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; color: #8fa3c8; }
+  #speed { width: 100%; accent-color: #5fb7ff; margin-top: 4px; }
+  .btnrow button {
+    font: inherit; color: #c9d4ea; background: #1a2340;
+    border: 1px solid #34416b; border-radius: 6px; padding: 4px 10px; cursor: pointer;
+  }
+  .btnrow button:hover { background: #243158; }
+  .tag { color: #5d6d8f; }
+  .hint { margin-top: 10px; color: #5d6d8f; font-size: 10px; line-height: 1.6; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="hud">
+  <h1>N-BODY · VELOCITY VERLET</h1>
+  <div class="meta">G = 1 · Δt = 0.005 · softening ε = 1.0 · 7 bodies</div>
+  <div id="time" class="readout">t = 0.00 tu (0.00 yr)</div>
+  <div id="energy" class="readout">E  = …</div>
+  <div id="drift" class="readout">ΔE/E₀ = …</div>
+  <div class="row"><span>speed</span><span id="speedVal">1.0×</span></div>
+  <input id="speed" type="range" min="0" max="10" step="0.1" value="1" />
+  <div class="row btnrow">
+    <button id="reset">reset system</button>
+    <span id="focusTag" class="tag">free orbit</span>
+  </div>
+  <div class="hint">
+    drag: rotate · scroll: zoom · right-drag: pan<br />
+    click a body: follow it · click empty space: release
+  </div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// Integration timestep: DT = 0.005 sim-time units (velocity Verlet, substepped per frame)
+const G = 1.0;
+const SOFT2 = 1.0 * 1.0;
+const DT = 0.005;
+const MAX_SUBSTEPS = 240;
+const TRAIL_N = 1000;
+const STAR_MASS = 2000;
+
+// Each planet's initial tangential speed is v = sqrt(G * M_star / r) * k.
+// k = 1 gives a (near-)circular orbit; k = 0.60 gives the eccentric intruder
+// (aphelion at r = 92, perihelion near r = 20, e ≈ 0.64).
+const DEFS = [
+  { name: 'Sol',    m: STAR_MASS, r: 0,   k: 0,    incl: 0,   phase: 0,   color: 0xffc94d, star: true },
+  { name: 'Cetus',  m: 3,         r: 40,  k: 1,    incl: 3,   phase: 0,   color: 0x5fb7ff },
+  { name: 'Terra',  m: 5,         r: 58,  k: 1,    incl: -2,  phase: 110, color: 0x54ff9b },
+  { name: 'Aurea',  m: 2,         r: 78,  k: 1,    incl: 4,   phase: 215, color: 0xffa94d },
+  { name: 'Ganym',  m: 7,         r: 100, k: 1,    incl: -3,  phase: 320, color: 0xff6fa5 },
+  { name: 'Boreas', m: 4,         r: 124, k: 1,    incl: 2,   phase: 70,  color: 0xc78bff },
+  { name: 'Errant', m: 2.5,       r: 92,  k: 0.60, incl: 0,   phase: 40,  color: 0xff5346 },
+];
+
+const bodies = DEFS.map(def => {
+  const b = {
+    def, m: def.m,
+    pos: new THREE.Vector3(), vel: new THREE.Vector3(),
+    acc: new THREE.Vector3(), acc2: new THREE.Vector3(),
+    pos0: new THREE.Vector3(), vel0: new THREE.Vector3(),
+  };
+  if (def.r > 0) {
+    const th = def.phase * Math.PI / 180;
+    b.pos.set(Math.cos(th) * def.r, 0, Math.sin(th) * def.r);
+    const v = def.k * Math.sqrt(G * STAR_MASS / def.r);
+    b.vel.set(-Math.sin(th) * v, 0, Math.cos(th) * v);
+    if (def.incl !== 0) {
+      const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), def.incl * Math.PI / 180);
+      b.pos.applyQuaternion(q);
+      b.vel.applyQuaternion(q);
+    }
+  }
+  b.displayR = Math.max(0.8, 0.55 * Math.cbrt(def.m));
+  b.pickR = Math.max(b.displayR * 2.4, 3);
+  return b;
+});
+
+// Zero total momentum so the barycenter stays at the origin (star recoils slightly).
+{
+  const p = new THREE.Vector3();
+  for (let i = 1; i < bodies.length; i++) p.addScaledVector(bodies[i].vel, bodies[i].m);
+  bodies[0].vel.copy(p).multiplyScalar(-1 / STAR_MASS);
+}
+for (const b of bodies) { b.pos0.copy(b.pos); b.vel0.copy(b.vel); }
+
+const YEAR = 2 * Math.PI * Math.cbrt(40 ** 3 / (G * STAR_MASS));
+
+function computeAccels() {
+  for (const b of bodies) b.acc2.set(0, 0, 0);
+  for (let i = 0; i < bodies.length; i++) {
+    const bi = bodies[i];
+    for (let j = i + 1; j < bodies.length; j++) {
+      const bj = bodies[j];
+      const dx = bj.pos.x - bi.pos.x;
+      const dy = bj.pos.y - bi.pos.y;
+      const dz = bj.pos.z - bi.pos.z;
+      const d2 = dx * dx + dy * dy + dz * dz + SOFT2;
+      const inv = 1 / Math.sqrt(d2);
+      const f = G * inv * inv * inv;
+      const fx = f * dx, fy = f * dy, fz = f * dz;
+      bi.acc2.x += fx * bj.m; bi.acc2.y += fy * bj.m; bi.acc2.z += fz * bj.m;
+      bj.acc2.x -= fx * bi.m; bj.acc2.y -= fy * bi.m; bj.acc2.z -= fz * bi.m;
+    }
+  }
+}
+
+function stepVerlet(dt) {
+  const h2 = 0.5 * dt * dt;
+  for (const b of bodies) {
+    b.pos.x += b.vel.x * dt + b.acc.x * h2;
+    b.pos.y += b.vel.y * dt + b.acc.y * h2;
+    b.pos.z += b.vel.z * dt + b.acc.z * h2;
+  }
+  computeAccels();
+  const hf = 0.5 * dt;
+  for (const b of bodies) {
+    b.vel.x += (b.acc.x + b.acc2.x) * hf;
+    b.vel.y += (b.acc.y + b.acc2.y) * hf;
+    b.vel.z += (b.acc.z + b.acc2.z) * hf;
+    b.acc.copy(b.acc2);
+  }
+}
+
+function advanceSim(advance) {
+  let n = Math.round(advance / DT);
+  if (n < 1) n = 1;
+  if (n > MAX_SUBSTEPS) n = MAX_SUBSTEPS;
+  const dt = advance / n;
+  for (let s = 0; s < n; s++) stepVerlet(dt);
+}
+
+function computeEnergy() {
+  let ke = 0;
+  for (const b of bodies) ke += 0.5 * b.m * (b.vel.x * b.vel.x + b.vel.y * b.vel.y + b.vel.z * b.vel.z);
+  let pe = 0;
+  for (let i = 0; i < bodies.length; i++) {
+    const bi = bodies[i];
+    for (let j = i + 1; j < bodies.length; j++) {
+      const bj = bodies[j];
+      const dx = bj.pos.x - bi.pos.x, dy = bj.pos.y - bi.pos.y, dz = bj.pos.z - bi.pos.z;
+      pe -= G * bi.m * bj.m / Math.sqrt(dx * dx + dy * dy + dz * dz + SOFT2);
+    }
+  }
+  return { ke, pe, total: ke + pe };
+}
+
+computeAccels();
+for (const b of bodies) b.acc.copy(b.acc2);
+const E0 = computeEnergy().total;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x020308);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 20000);
+const CAM0 = new THREE.Vector3(0, 130, 250);
+camera.position.copy(CAM0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 3;
+controls.maxDistance = 4000;
+
+scene.add(new THREE.AmbientLight(0x8899cc, 0.5));
+
+const unitSphere = new THREE.SphereGeometry(1, 40, 24);
+for (const b of bodies) {
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x0b0d16, roughness: 0.5, metalness: 0.1,
+    emissive: new THREE.Color(b.def.color),
+    emissiveIntensity: b.def.star ? 1.3 : 0.85,
+  });
+  const mesh = new THREE.Mesh(unitSphere, mat);
+  mesh.scale.setScalar(b.displayR);
+  mesh.position.copy(b.pos);
+  scene.add(mesh);
+  b.mesh = mesh;
+}
+const starLight = new THREE.PointLight(0xfff1d0, 4000, 0, 2);
+bodies[0].mesh.add(starLight);
+
+class Trail {
+  constructor(hex) {
+    this.positions = new Float32Array(TRAIL_N * 3);
+    const cols = new Float32Array(TRAIL_N * 3);
+    const c = new THREE.Color(hex);
+    for (let i = 0; i < TRAIL_N; i++) {
+      const f = (i / (TRAIL_N - 1)) ** 2;
+      cols[3 * i] = c.r * f; cols[3 * i + 1] = c.g * f; cols[3 * i + 2] = c.b * f;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(this.positions, 3).setUsage(THREE.DynamicDrawUsage));
+    geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    this.line = new THREE.Line(geo, new THREE.LineBasicMaterial({
+      vertexColors: true, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    this.line.frustumCulled = false;
+  }
+  reset(p) {
+    for (let i = 0; i < TRAIL_N; i++) {
+      this.positions[3 * i] = p.x; this.positions[3 * i + 1] = p.y; this.positions[3 * i + 2] = p.z;
+    }
+    this.line.geometry.attributes.position.needsUpdate = true;
+  }
+  push(p) {
+    const n3 = TRAIL_N * 3;
+    this.positions.copyWithin(0, 3, n3);
+    const k = (TRAIL_N - 1) * 3;
+    this.positions[k] = p.x; this.positions[k + 1] = p.y; this.positions[k + 2] = p.z;
+    this.line.geometry.attributes.position.needsUpdate = true;
+  }
+}
+for (const b of bodies) {
+  b.trail = new Trail(b.def.color);
+  b.trail.reset(b.pos);
+  scene.add(b.trail.line);
+}
+
+function makeStarfield() {
+  const COUNT = 3500;
+  const pos = new Float32Array(COUNT * 3);
+  const col = new Float32Array(COUNT * 3);
+  for (let i = 0; i < COUNT; i++) {
+    const u = Math.random() * 2 - 1;
+    const ph = Math.random() * Math.PI * 2;
+    const s = Math.sqrt(Math.max(0, 1 - u * u));
+    const R = 1600 + Math.random() * 2200;
+    pos[3 * i] = s * Math.cos(ph) * R;
+    pos[3 * i + 1] = u * R;
+    pos[3 * i + 2] = s * Math.sin(ph) * R;
+    const b = 0.2 + 0.8 * Math.pow(Math.random(), 1.6);
+    const warm = Math.random();
+    col[3 * i] = b * (0.8 + 0.2 * warm);
+    col[3 * i + 1] = b * (0.85 + 0.15 * warm);
+    col[3 * i + 2] = b * (0.95 + 0.05 * (1 - warm));
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return new THREE.Points(geo, new THREE.PointsMaterial({
+    size: 1.7, sizeAttenuation: false, vertexColors: true,
+    transparent: true, opacity: 0.9, depthWrite: false,
+  }));
+}
+const starfield = makeStarfield();
+scene.add(starfield);
+
+const timeEl = document.getElementById('time');
+const energyEl = document.getElementById('energy');
+const driftEl = document.getElementById('drift');
+const speedEl = document.getElementById('speed');
+const speedValEl = document.getElementById('speedVal');
+const resetBtn = document.getElementById('reset');
+const focusEl = document.getElementById('focusTag');
+
+let speed = 1;
+speedEl.addEventListener('input', () => {
+  speed = parseFloat(speedEl.value);
+  speedValEl.textContent = speed === 0 ? 'paused' : speed.toFixed(1) + '×';
+});
+
+let focusIdx = null;
+const focusDir = new THREE.Vector3();
+let focusDist = 0;
+let focusBlend = 1;
+const prevFocusPos = new THREE.Vector3();
+const _a = new THREE.Vector3(), _b = new THREE.Vector3();
+
+function focusOn(i) {
+  focusIdx = i;
+  const b = bodies[i];
+  _a.subVectors(camera.position, b.pos);
+  if (_a.lengthSq() < 1e-8) _a.set(0, 0.4, 1);
+  focusDir.copy(_a).normalize();
+  focusDist = Math.max(b.displayR * 7, 16);
+  focusBlend = 0;
+  prevFocusPos.copy(b.pos);
+  focusEl.textContent = 'following ' + b.def.name;
+}
+
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+
+function pickBody(cx, cy) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  ndc.x = ((cx - rect.left) / rect.width) * 2 - 1;
+  ndc.y = -((cy - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(ndc, camera);
+  const o = raycaster.ray.origin, dir = raycaster.ray.direction;
+  let best = null, bestT = Infinity;
+  for (let i = 0; i < bodies.length; i++) {
+    const b = bodies[i];
+    _a.subVectors(o, b.pos);
+    const tca = _a.dot(dir);
+    if (tca <= 0) continue;
+    const d2 = _a.lengthSq() - tca * tca;
+    const R = b.pickR;
+    if (d2 > R * R) continue;
+    const t = tca - Math.sqrt(R * R - d2);
+    if (t < bestT) { bestT = t; best = i; }
+  }
+  return best;
+}
+
+let pdX = 0, pdY = 0;
+renderer.domElement.addEventListener('pointerdown', e => { pdX = e.clientX; pdY = e.clientY; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (Math.hypot(e.clientX - pdX, e.clientY - pdY) > 6) return;
+  const i = pickBody(e.clientX, e.clientY);
+  if (i !== null) focusOn(i);
+  else { focusIdx = null; focusEl.textContent = 'free orbit'; }
+});
+
+resetBtn.addEventListener('click', () => {
+  for (const b of bodies) { b.pos.copy(b.pos0); b.vel.copy(b.vel0); }
+  computeAccels();
+  for (const b of bodies) {
+    b.acc.copy(b.acc2);
+    b.mesh.position.copy(b.pos);
+    b.trail.reset(b.pos);
+  }
+  simTime = 0;
+  focusIdx = null;
+  focusEl.textContent = 'free orbit';
+  camera.position.copy(CAM0);
+  controls.target.set(0, 0, 0);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+let simTime = 0;
+let lastT = performance.now();
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dtWall = Math.min((now - lastT) / 1000, 0.05);
+  lastT = now;
+
+  const advance = speed * dtWall;
+  if (advance > 0) {
+    advanceSim(advance);
+    simTime += advance;
+    for (const b of bodies) b.trail.push(b.pos);
+  }
+
+  for (const b of bodies) b.mesh.position.copy(b.pos);
+
+  if (focusIdx !== null) {
+    const b = bodies[focusIdx];
+    _a.subVectors(b.pos, prevFocusPos);
+    camera.position.add(_a);
+    if (focusBlend < 1) {
+      focusBlend = Math.min(1, focusBlend + dtWall / 0.7);
+      _b.copy(focusDir).multiplyScalar(focusDist).add(b.pos);
+      camera.position.lerp(_b, 1 - Math.exp(-dtWall * 8));
+    }
+    controls.target.copy(b.pos);
+    prevFocusPos.copy(b.pos);
+  }
+
+  controls.update();
+  starfield.rotation.y += dtWall * 0.005;
+
+  const e = computeEnergy();
+  timeEl.textContent = 't = ' + simTime.toFixed(2) + ' tu (' + (simTime / YEAR).toFixed(2) + ' yr)';
+  energyEl.textContent = 'E  = ' + e.total.toFixed(2) + '  KE ' + e.ke.toFixed(1) + '  PE ' + e.pe.toFixed(1);
+  const drift = (e.total - E0) / Math.abs(E0) * 100;
+  driftEl.textContent = 'ΔE/E₀ = ' + (drift >= 0 ? '+' : '') + drift.toExponential(2) + ' %';
+
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
