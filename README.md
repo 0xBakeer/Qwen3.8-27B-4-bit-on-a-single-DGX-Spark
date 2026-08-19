@@ -46,6 +46,39 @@ concurrency; do not quantize for fleet throughput.
 4-bit also costs **7–9 % of prefill throughput** at 32K–100K prompts (§4), because Marlin
 dequantization is compute-bound work that prefill pays for.
 
+
+## DFlash 2 does not run on either 4-bit checkpoint
+
+[DFlash 2](https://inco.ai/blog/dflash2/) (Inco AI, August 2026) is the strongest drafter
+currently available for this model. **Under vLLM it cannot be used with either checkpoint in
+this repo** — it requires an unquantized target LM head, and both 4-bit builds fail the check
+(NVFP4 quantizes the head; AutoRound stores it in bf16 but vLLM still assigns it a quantized
+method). FP8 is the only build that works.
+
+**llama.cpp has no such restriction**, and there it is the fastest single-stream
+configuration measured anywhere in this work:
+
+| engine · config | generative | edit-heavy |
+|---|---:|---:|
+| llama.cpp Q4_K_M, no spec | 10.84 | 10.84 |
+| llama.cpp Q4_K_M + MTP `k=7` | 30.38 | — |
+| **llama.cpp Q4_K_M + DFlash2 `k=7`** | **37.58** | **60.89** |
+| vLLM FP8 + DFlash2 `k=7` | 31.72 | 49.20 |
+
+But llama.cpp **saturates at ~77 tok/s aggregate** and its TTFT p50
+reaches 4.0 s at c16, against vLLM's
+220 tok/s and 1.1 s. The rule this repo
+already argues for quantization extends to the engine: **llama.cpp for one interactive user,
+vLLM for anything else.**
+
+**Separately — the drafter in most 4-bit recipes is the wrong one.** On identical NVFP4
+weights, free in-checkpoint MTP `k=3` beats the `Doopeworld` DSpark `k=7` drafter at *every*
+concurrency, by +15% at c1 rising to
+**+49% at c16**, while saving a 2.6 GiB drafter.
+
+Full detail, the c1-c16 curves, the block-size ceiling and quality measurements:
+**[DFLASH2.md](DFLASH2.md)**. References: [SOURCES.md](SOURCES.md).
+
 ## Read this next if you are choosing a quantization
 
 **GB10 has no native FP4 compute path.** SM121 lacks the tensor-core support the FP4
