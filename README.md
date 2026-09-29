@@ -1,5 +1,10 @@
 # Qwen3.8-27B 4-bit on a single DGX Spark (GB10 / SM121)
 
+> **Deprecated.** This recipe is no longer maintained. Qwen3.8-27B on a single DGX Spark now runs on
+> [TandemLLM](https://github.com/0xBakeer/TandemLLM), an engine built for this model and this box, with
+> its own NVFP4 weights, speculative draft trees and a one-line installer. The recipe and its numbers stay
+> here as they were measured.
+
 A measured serving recipe for 4-bit Qwen3.8-27B on one DGX Spark, with a side-by-side
 comparison of two 4-bit checkpoints and the FP8 baseline they are measured against.
 Every number in [RESULTS.md](RESULTS.md) came from the harness in `bench/`.
